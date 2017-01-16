@@ -1,0 +1,120 @@
+#!/bin/bash
+
+if [[ "$#" -ne 3 ]] ; then
+	echo "USAGE: $0 <TALUS_MASTER_HOST> <MAX_VMS> <INTF [e.g. eth0]>"
+	exit
+fi
+
+DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+
+sudo mkdir -p /var/log/talus
+
+sudo apt-get install -y \
+	libvirt-bin \
+	qemu-kvm \
+	virtinst \
+	python-libvirt \
+	qemu-utils \
+	build-essential \
+	python-pip \
+	python-dev \
+	apparmor-utils \
+	wget \
+	genisoimage \
+	libssl-dev \
+	libffi-dev \
+	gcc make pkg-config libxml2-dev libgnutls-dev libdevmapper-dev libcurl4-gnutls-dev python-dev libpciaccess-dev libxen-dev libnl-route-3-dev libyajl-dev uuid-dev libpcap-dev xsltproc
+
+sudo pip install \
+	mongoengine \
+	mock \
+	netifaces \
+	paramiko \
+	pika \
+	pymongo \
+	pywinrm \
+	scp \
+	sh \
+	twisted \
+	xmltodict \
+	service_identity \
+	cryptography
+
+# TODO - figure out what's up with this?
+# libvirt network filters weren't working until I did
+# this....
+sudo aa-complain /usr/sbin/libvirtd
+
+$DIR/install_networks
+$DIR/install_filters
+
+if [[ `systemctl` =~ -\.mount ]]; then
+echo "Installing talus-slave as systemd service"
+
+cat << EOF | sudo tee /etc/systemd/system/talus-slave.service > /dev/null
+[Unit]
+Description=Talus Slave
+Wants=network-online.target
+After=network-online.target
+ 
+[Service]
+Restart=always
+ExecStart=/usr/local/bin/talus-slave
+
+[Install]
+WantedBy=default.target
+EOF
+sudo chmod 664 /etc/systemd/system/talus-slave.service
+
+cat << EOF | sudo tee /usr/local/bin/talus-slave > /dev/null
+#!/bin/bash
+if [ "$EUID" -ne 0 ]; then
+	echo "Must be run as root"
+	exit
+fi
+aa-complain /usr/sbin/libvirtd
+aa-complain /usr/lib/libvirt/virt-aa-helper
+
+$(readlink -f $DIR)/start_raw $1 $2 $3 2>&1 | tee /var/log/talus/slave.log
+
+EOF
+
+sudo chmod a+x /usr/local/bin/talus-slave
+
+else
+
+cat << EOF | sudo tee  /etc/init/talus_slave.conf > /dev/null
+description "Talus Slave Daemon"
+author		"Optiv Labs"
+
+start on (started networking)
+stop on shutdown
+respawn
+
+script
+	aa-complain /usr/sbin/libvirtd
+	$(readlink -f $DIR)/start_raw $1 $2 $3 2>&1 | tee /var/log/talus/slave.log
+end script
+EOF
+
+fi
+
+sudo sh -c 'echo GRUB_CMDLINE_LINUX_DEFAULT="max_loop=64" >> /etc/default/grub'
+sudo update-grub2
+
+sudo sed -ri 's/#vnc_listen = "0.0.0.0"/vnc_listen = "0.0.0.0"/' /etc/libvirt/qemu.conf
+
+echo "NOTE NOTE NOTE NOTE NOTE NOTE NOTE"
+echo "NOTE NOTE NOTE NOTE NOTE NOTE NOTE"
+echo "NOTE NOTE NOTE NOTE NOTE NOTE NOTE"
+echo "NOTE NOTE NOTE NOTE NOTE NOTE NOTE"
+echo ""
+echo "you must reboot for the max loop device changes to take effect"
+echo ""
+echo "also make sure that vnc is listening on 0.0.0.0 in /etc/libvirt/qemu.conf and"
+echo "that mac_filter=0 in /etc/libvirt/qemu.conf"
+echo ""
+echo "NOTE NOTE NOTE NOTE NOTE NOTE NOTE"
+echo "NOTE NOTE NOTE NOTE NOTE NOTE NOTE"
+echo "NOTE NOTE NOTE NOTE NOTE NOTE NOTE"
+echo "NOTE NOTE NOTE NOTE NOTE NOTE NOTE"
