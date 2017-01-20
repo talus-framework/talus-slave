@@ -32,6 +32,8 @@ class AmqpQueueHandler(threading.Thread):
 
         while self._running.is_set():
             method = None
+            props = None
+            body = None
             with self.lock:
                 try:
                     method, props, body = self.channel.basic_get(
