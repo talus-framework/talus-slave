@@ -10,7 +10,6 @@ import pika
 pika_logger = logging.getLogger('pika')
 pika_logger.setLevel(logging.CRITICAL)
 
-
 class AmqpQueueHandler(threading.Thread):
     daemon = True
 
@@ -46,7 +45,11 @@ class AmqpQueueHandler(threading.Thread):
                 time.sleep(0.1)
                 continue
             self._log.debug("received message")
-            self.callback(self.channel, method, props, body)
+
+            try:
+                self.callback(self.channel, method, props, body)
+            except Exception as e:
+                self._log.error("Error calling callback!", exc_info=True)
 
         self._log.debug("finished")
 
@@ -135,11 +138,11 @@ class AmqpManager(threading.Thread):
         if self._amqp_channel is not None:
             try:
                 self._amqp_channel.stop_consuming()
-            except RuntimeError:
+            except RuntimeError as e:
                 pass
             try:
                 self._amqp_conn.close()
-            except RuntimeError:
+            except RuntimeError as e:
                 pass
         self._running.clear()
 
@@ -179,8 +182,7 @@ class AmqpManager(threading.Thread):
             self._cached_bind_queues.append((exchange, queue))
         else:
             self._amqp_channel.queue_bind(exchange=exchange,
-                                          queue=queue
-                                          )
+                                          queue=queue)
 
     def declare_queue(self, queue_name, **props):
         """Declare the queue ``queue_name`` with properties defined in
@@ -275,7 +277,7 @@ class AmqpManager(threading.Thread):
 
         self._amqp_connected.set()
 
-    def _job_queue(self, channel=None, method=None, properties=None, body):
+    def _job_queue(self, channel, method, properties, body):
         """Called when an AMQP message is received
         """
         print("received {}".format(body))

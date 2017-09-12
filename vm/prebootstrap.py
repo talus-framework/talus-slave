@@ -33,12 +33,9 @@ def init_comms():
         log.info("forcing WinRM service to start")
         os.system("sc start WinRM")
 
-
-def find_bootstrap(attempts=25):
-    # log.info("determining temporary folder")
+def find_bootstrap():
     log.info("determining bootstrap location")
-
-    for x in xrange(attempts):
+    while True:
         sys.stdout.write(".")
 
         os_name = os.name.lower()

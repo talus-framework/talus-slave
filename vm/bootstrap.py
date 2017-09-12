@@ -1,34 +1,56 @@
 #!/usr/bin/env python
 # encoding: utf-8
 
+
+
+"""
+This is the bootstrap that installs required code at runtime
+and runs the tool for the job.
+
+The bootstrap is also responsible for communicating with the
+slave daemon on the host (this is assumed to be running in
+a virtual machine guest).
+"""
+
+
 from __future__ import absolute_import
 
+
+from pprint import pprint
+from requests.auth import HTTPBasicAuth
 import base64
 import imp
 import json
 import logging
+import marshal
 import os
 import pip
 import pip.req
 import re
 import requests
 import select
+import shutil
 import site
 import socket
 import struct
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import traceback
-from requests.auth import HTTPBasicAuth
 
 
 class FriendlyJSONEncoder(json.JSONEncoder):
+    """Encode json data correctly. Created in order to handle
+    ObjectId instances correctly.
+    """
     def default(self, o):
         # I don't want to have to import bson here, since that's installed
         # via a top-level requirements.txt with pymongo. We'll just check the
-        # class name instead (HACK)
+        # class name instead (HACK).
+        # 
+        # also see the note in HostComms.send_msg
         if o.__class__.__name__ == "ObjectId":
             return str(o)
         else:
@@ -41,6 +63,7 @@ ORIG_ARGS = sys.argv
 logging.getLogger().handlers = []
 
 logging.getLogger("urllib3").setLevel(logging.WARN)
+logging.getLogger("pip").setLevel(logging.WARN)
 
 DEV = len(sys.argv) > 1 and sys.argv[1] == "dev"
 
@@ -75,12 +98,23 @@ class LogAccumulator(logging.Handler):
 
 
 class HostComms(threading.Thread):
+    """Communications class to communicate with the host.
+    """
     def __init__(self, recv_callback, job_id, job_idx, tool, dev=False):
+        """Create the HostComms instance.
+
+        :param function recv_callback: A callback to call when new messages are received.
+        :param str job_id: The id of the current job.
+        :param int job_idx: The index into the current job.
+        :param str tool: The name of the tool to run.
+        :param bool dev: If this class should run in dev mode.
+        """
         super(HostComms, self).__init__()
 
         self._log = logging.getLogger("HostComms")
         self._dev = dev
 
+        # spin until we have a real ip address
         while True:
             self._my_ip = socket.gethostbyname(socket.gethostname())
             if self._my_ip.startswith("127.0"):
@@ -93,13 +127,13 @@ class HostComms(threading.Thread):
                         break
 
             if not self._my_ip.startswith("192.168.123."):
-                self._log.debug("we don't have an ip address yet (currently '{}')".format(self._my_ip))
+                self._log.debug("We don't have an ip address yet (currently '{}')".format(self._my_ip))
                 time.sleep(0.2)
                 continue
 
             break
 
-        self._log.debug("we have an ip! {}".format(self._my_ip))
+        self._log.debug("We have an ip! {}".format(self._my_ip))
 
         self._host_ip = self._my_ip.rsplit(".", 1)[0] + ".1"
         self._host_port = 55555
@@ -120,7 +154,11 @@ class HostComms(threading.Thread):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
     def run(self):
-        self._log.info("running")
+        """Run the host comms in a new thread.
+
+        :returns: None
+        """
+        self._log.info("Running")
         self._running.set()
 
         if not self._dev:
@@ -128,6 +166,7 @@ class HostComms(threading.Thread):
 
         self._connected.set()
 
+        # select on the socket until we're told not to run anymore
         while self._running.is_set():
             if not self._dev:
                 reads, _, _ = select.select([self._sock], [], [], 0.1)
@@ -142,20 +181,29 @@ class HostComms(threading.Thread):
                     self._recv_callback(data)
             time.sleep(0.1)
 
-        self._log.info("finished")
+        self._log.info("Finished")
 
     def stop(self):
-        self._log.info("stopping")
+        """Stop the host comms from running
+        """
+        self._log.info("Stopping")
         self._running.clear()
 
     def send_msg(self, type, data):
-        data = json.dumps({
-            "job": self._job_id,
-            "idx": self._job_idx,
-            "tool": self._tool,
-            "type": type,
-            "data": data
-        },
+        """Send a message to the host.
+
+        :param str type: The type of message to send
+        :param dict data: The data to send to the host
+        :returns: None
+        """
+        data = json.dumps(
+            {
+                "job": self._job_id,
+                "idx": self._job_idx,
+                "tool": self._tool,
+                "type": type,
+                "data": data
+            },
 
             # use this so that users don't run into errors with ObjectIds not being
             # able to be encodable. If using bson.json_util.dumps was strictly used
@@ -259,7 +307,7 @@ class TalusCodeImporter(object):
             # THIS IS IMPORTANT, YES WE WANT TO RETURN NONE!!!
             # see the comment in the docstring
             return None
-        except ImportError:
+        except ImportError as e:
             pass
 
         if package_name == "talus" and self._module_in_git(abs_name):
@@ -278,11 +326,8 @@ class TalusCodeImporter(object):
         # we NEED to have the 2nd check here or else it will keep downloading
         # the same package over and over
         if package_name in self.cache["pypi"] and package_name not in sys.modules:
-            self.install_package(package_name)
+            self.install_cached_package(package_name)
             return None
-        # just in case sys.argv got mucked with somehow/somewhere
-        # os.execvp("python", [__file__] + ORIG_ARGS)
-        # os.execvp("python", ORIG_ARGS)
 
         # THIS IS IMPORTANT, YES WE WANT TO RETURN NONE!!!
         # THIS IS IMPORTANT, YES WE WANT TO RETURN NONE!!!
@@ -290,47 +335,17 @@ class TalusCodeImporter(object):
         # THIS IS IMPORTANT, YES WE WANT TO RETURN NONE!!!
         # see the comment in the docstring
         return None
-
-    #
-    # 	def load_module(self, abs_name, *args):
-    # 		if abs_name in sys.modules:
-    # 			mod = sys.modules[abs_name]
-    # 		else:
-    # 			mod = sys.modules.setdefault(abs_name, imp.new_module(abs_name))
-    #
-    # 		fp, pathname, desc = imp.find_module(abs_name)
-    #
-    # 		actual_path = pathname
-    # 		if not actual_path.endswith(".py") and not actual_path.endswith(".pyc"):
-    # 			actual_path = os.path.join(actual_path, "__init__.py")
-    #
-    # 		mod.__file__ = actual_path
-    # 		mod.__name__ = abs_name
-    # 		mod.__path__ = pathname
-    # 		mod.__loader__ = self
-    # 		mod.__package__ = ".".join(abs_name.split(".")[:-1])
-    #
-    # 		if actual_path.endswith("__init__.py") or actual_path.endswith("__init__.pyc"):
-    # 			mod.__path__ = [ pathname ]
-    #
-    # 		data = open(actual_path, "rb").read()
-    # 		if actual_path.endswith(".pyc"):
-    # 			code = marshal.loads(data[8:])
-    # 		else:
-    # 			code = compile(data, actual_path, "exec")
-    #
-    # 		exec code in mod.__dict__
-    #
-    # 		return mod
-
+    
     def download_module(self, abs_name):
         """Download the module found at ``abs_name`` from the talus git repository
 
         :param str abs_name: The absolute module name of the module to be downloaded
         """
-        self._log.info("downloading module {}".format(abs_name))
+        self._log.info("Downloading module {}".format(abs_name))
 
         path = abs_name.replace(".", "/")
+        filepath = path + ".py"
+
         info = self._git_show(path)
 
         if info is None:
@@ -339,143 +354,292 @@ class TalusCodeImporter(object):
                 raise ImportError(abs_name)
             info = info_test
 
-        self._log.info("loading module {} from git".format(abs_name))
-
-        if info["type"] == "listing":
-            return self._download_folder(abs_name, info, self._code_dir)
-        elif info["type"] == "file":
-            return self._download_file(abs_name, info, self._code_dir)
+        self._download(path, info=info)
 
         return None
 
-    def _download_folder(self, abs_name, info, dest, recurse=None):
-        """Download the module (folder/__init__.py) from git. The module folder will
-        only be recursively downloaded if it is a subfolder of the tools/components/lib/packages
-        folder.
+    def install_cached_package(self, package_name):
+        """Install the python package from our cached pypi.
+
+        :param str package_name: The name of the python package to install
+        :returns: None
         """
-        # if we're loading the root directory of a tool/component/library, recursively
-        # download everything in git in that folder
-        match = re.match(r'^talus\.(tools|packages|components|lib)\.[a-zA-Z_0-9]+$', abs_name)
-
-        if recurse is None:
-            recurse = (match is not None)
-
-        self._download(dest, info=info, recurse=recurse)
-
-    def install_requirements(self, rel_path):
-        self._log.info("installing requirements {}".format(rel_path))
-        full_path = os.path.join(self._code_dir, rel_path)
-
-        #		# from pip
-        #		for item in pip.req.parse_requirements(full_path, "somesessionid"):
-        #			if isinstance(item, pip.req.InstallRequirement):
-        #				self._log.info("downloading package {}".format(item.name))
-        #				self._download(self._pypi_dir, path="talus/pypi/simple/{}".format(item.name), recurse=True)
+        self._log.info("Installing package {!r} from talus pypi".format(package_name))
+        pinfo = self.cache["pypi"][package_name]
+        pypi_hostname = re.match(r'^.*://([^/]+)/.*$', self.pypi_loc).group(1)
 
         try:
-            pip.main([
+            self._run_pip_main([
                 "install",
                 "--user",
-                # grab only the hostname from the pypi_loc
-                "--trusted-host", re.match(r'^.*://([^/]+)/.*$', self.pypi_loc).group(1),
-                "-i",
-                self.pypi_loc,
-                # "file://{}".format(os.path.abspath(os.path.join(self._pypi_dir, "talus", "pypi", "simple")).replace("\\", "/")),
-                "-r",
-                full_path
+                "--trusted-host", pypi_hostname,
+                "-i", self.pypi_loc,
+                package_name
             ])
-        except SystemExit:
-            self._log.error("Could not install package. Sorry :^(")
-
-    def install_package(self, package_name):
-        self._log.info("downloading package {} to local python index".format(package_name))
-        self.cache["pypi"][package_name]
-
-        # folder structure:
-        # pypi/
-        #  |--pymongo/
-        #		|--index.html
-        #		|--pymongo-0.3.0.tar.gz
-        #
-        self._download(self._pypi_dir, path="talus/pypi/simple/{}".format(package_name), recurse=True)
-
-        self._log.info("installing package {} from local python index".format(package_name))
-        pip.main([
-            "install",
-            "--user",
-            "-i",
-            self.pypi_loc,
-            package_name
-        ])
+        except SystemExit as e:
+            raise Exception("Is SystemExit expected?")
 
     def install_package_from_talus(self, package_name):
-        """Install the package found in git at talus/package/<package_name>
+        """Install the package in talus/packages
         """
-        info = self._git_show("talus/packages/{}".format(package_name))
-        self._download_folder("talus/packages/{}".format(package_name), info, self._code_dir, recurse=True)
-        full_path = os.path.join(self._code_dir, "talus", "packages", package_name)
+        self._log.info(
+            "Installing package {!r} from talus_code/talus/packages".format(package_name)
+        )
 
+        info = self._git_show("talus/packages/{}".format(package_name))
+
+        # should handle .tar.gz files if available
+        self._download("talus/packages/{}".format(package_name))
+
+        full_path = os.path.join(
+            self._code_dir,
+             "talus",
+             "packages",
+             package_name
+        )
+
+        pypi_hostname = re.match(r'^.*://([^/]+)/.*$', self.pypi_loc).group(1)
         try:
-            pip.main([
+            self._run_pip_main([
                 "install",
                 "--user",
                 "--upgrade",
+                # point pip at the talus pypi in case the package has a
+                # requirements.txt
+                "--trusted-host", pypi_hostname,
+                "-i", self.pypi_loc,
                 full_path
             ])
-        except SystemExit:
-            self._log.error("Could not install package from talus git. You dun goofed up somewhere")
+        except SystemExit as e:
+            # TODO
+            raise Exception("Is SystemExit normal?")
 
-    def _download_file(self, abs_name=None, info, dest):
-        """Download the single file from git
+    def _download_file(self, path, info=None):
+        """Download the specified resource at ``path``, optionally using the
+        already-fetched ``info`` (result of ``self._git_show(path)``).
+
+        :param str path: The relative path using '/' separators inside the talus_code repository
+        :param dict info: The result of ``self._git_show(path)`` (default=``None``)
+        :returns: None
         """
-        self._log.debug("downloading file: {}".format(info["filename"]))
+        self._log.debug("Downloading file {!r}".format(path))
 
-        path = os.path.join(dest, info["filename"])
-        with open(path, "wb") as f:
-            f.write(base64.b64decode(info["contents"]))
+        if info is None:
+            info = self._git_show(path)
 
-    def _download(self, dest, path=None, info=None, recurse=False):
-        """Download files/folders (maybe recursively) into ``self._code_dir``. If the path
-        is a directory, the directory's immediate children will be downloaded. If ``recurse``
-        is ``True``, then all children will downloaded recursively.
+        # info *SHOULD* be a basestring
+        if not isinstance(info, basestring):
+            raise Exception("{!r} was not a file! (info was {!r})".format(
+                path,
+                info
+            ))
 
-        :param str dest: The root path that the relative path should be added to
-        :param str path: The talus-code-repo relative path to download
-        :param dict info: The maybe-already-obtained info about the path
-        :param bool recurse: If it should be recursively downloaded
+        dest_path = os.path.join(self._code_dir, path.replace("/", os.path.sep))
+        self._save_file(dest_path, info)
+
+    def _save_file(self, file_path, data):
+        """Save the single file from git
+        
+        :param str file_path: The path to save the data to
+        :param str data: The data for the file at ``file_path``
+        :returns: None
         """
-        if path is None and info is None:
-            raise Exception("WTF are you doing?? unexpected condition")
+        self._ensure_directory(os.path.dirname(file_path))
+        with open(file_path, "wb") as f:
+            f.write(data)
 
-        if path is not None and info is None:
+    def _ensure_directory(self, dirname):
+        """Make sure the directory exists.
+
+        :param str dirname: The directory to ensure
+        :returns: None
+        """
+        if not os.path.exists(dirname):
+            os.makedirs(dirname)
+
+    def _download_folder(self, path, info=None, install_requirements=True):
+        """Download the folder specified by ``path``, possibly using already-fetched
+        ``info`` (result of ``self._git_show(path)``), optionally installing the
+        requirements.txt that may exist inside of the downloaded folder.
+
+        If the specified path is in one of the main subdirectories (see ``_is_in_main_subdir``),
+        the .tar.gz of the directory will be downloaded and extracted, if it exists.
+
+        :param str path: The relative path in the talus_code repository. Uses '/' for separators
+        :param dict info: Result of ``self._git_show(path)`` (default=``None``)
+        :param bool install_requirements: Whether requirements.txt should be installed (if it exists).
+            (default=True)
+        """
+        self._log.debug("Downloading directory {!r}".format(path))
+        if info is None:
+            info = self._git_show(path)
+
+        # check for compressed version of the folder
+        tar_gz_name = os.path.basename(path) + ".tar.gz"
+        parent_info = self._git_show(os.path.dirname(path))
+        if parent_info is None:
+            parent_info = {"items":[]}
+        if self._is_in_main_subdir(path) and tar_gz_name in parent_info["items"]:
+            self._log.debug("Found compressed version of main subdir {!r}".format(
+                path
+            ))
+            self._download_compressed_dir(path + ".tar.gz")
+
+        # download like normal
+        else:
+            # only recursively download tools/components/packages/lib folders/subdirectories
+            recurse = self._is_in_main_subdir(path, descendant=True)
+            for item in info["items"]:
+                if item.endswith("/") and not recurse:
+                    continue
+
+                item_path = path + "/" + item
+
+                # don't just download all of the .tar.gz's in main subdirectories!
+                if item_path.endswith(".tar.gz") and self._is_in_main_subdir(item_path):
+                    continue
+
+                self._download(item_path)
+
+        # install requirements.txt if requested
+        if install_requirements and "requirements.txt" in info["items"]:
+            self.install_requirements(path + "/requirements.txt")
+    
+    def install_requirements(self, rel_path):
+        """Install the requirements.txt located at ``rel_path``. Note that
+        the path is a relative path using ``/`` separators.
+
+        :param str rel_path: The relative path inside of ``self._code_dir``
+        :returns: None
+        """
+        self._log.debug("Installing requirements {}".format(rel_path))
+
+        rel_path = rel_path.replace("/", os.path.sep)
+        full_path = os.path.join(self._code_dir, rel_path)
+
+        with open(full_path, "rb") as f:
+            data = f.read()
+
+        # this takes a fair amount of time sometimes, so if there's an
+        # empty requirements.txt file, skip installing it
+        actual_req_count = 0
+        for line in data.split("\n"):
+            line = line.strip()
+            if line == "" or line.startswith("#"):
+                continue
+            actual_req_count += 1
+        if actual_req_count == 0:
+            self._log.debug("Empty requirements.txt, skipping")
+            return
+
+        try:
+            threading.local().indentation = 0
+            pypi_hostname = re.match(r'^.*://([^/]+)/.*$', self.pypi_loc).group(1)
+            self._run_pip_main([
+                "install",
+                    "--user",
+                    "--trusted-host", pypi_hostname,
+                    "-i", self.pypi_loc,
+                    "-r", full_path
+            ])
+        
+        # this is expected - pip.main will *always* exit
+        except SystemExit as e:
+            # TODO
+            raise Exception("Is SystemExit normal?")
+
+        threading.local().indentation = 0
+
+    def _is_in_main_subdir(self, path, descendant=False):
+        """Return ``True`` or ``False`` if the specified path is in one of the
+        main subdirectories of the talus codebase. I.e. if it is a subfolder of
+        or a file in one the following directories:
+
+          * talus/tools
+          * talus/components
+          * talus/packages
+          * talus/lib
+
+        :param str path: The path to check
+        :param bool descendant: If the path can be a several levels deep inside
+            a main subdirectory.
+        :returns: bool
+        """
+        base_regex = r'^(talus\/(tools|packages|components|lib))/'
+
+        # anything inside that directory
+        if descendant:
+            regex = base_regex + ".*"
+
+        # strictly must be an immediate child of one of the
+        # main subdirectories
+        else:
+            regex = base_regex + r'[^/]*$'
+
+        main_subdir_match = re.match(regex, path)
+        return main_subdir_match is not None
+
+    def _download(self, path, info=None):
+        """Download the specified ``path``, possibly using an already-
+        fetched ``info`` (result of ``self._git_show(path)``), optionally
+        recursively downloading the folder.
+
+        :param str path: The relative path in the talus_code repository. Uses '/' for separators
+        :param dict info: Result of ``self._git_show(path)`` (default=``None``)
+        :returns: None
+        """
+        if info is None:
             info = self._git_show(path)
 
         if info is None:
             raise Exception("Error! could not get information from code cache about {!r}".format(path))
 
-        self._log.debug("downloading file: {}".format(info["filename"]))
+        # it's a directory that we're downloading
+        if isinstance(info, dict):
+            self._download_folder(path, info=info)
 
-        base_path = os.path.join(dest, info["filename"])
+        # it's a single file that we're downloading
+        elif isinstance(info, basestring):
+            self._download_file(path, info=info)
 
-        if info["type"] == "listing":
-            if not os.path.exists(base_path):
-                os.makedirs(base_path)
+        else:
+            raise Exception("Unknown resource info: {!r}".format(info))
 
-            for item in info["items"]:
-                if item.endswith("/"):
-                    if recurse:
-                        self._download(dest, "{}/{}".format(info["filename"], item), recurse=recurse)
-                else:
-                    self._download(dest, "{}/{}".format(info["filename"], item))
+    def _download_compressed_dir(self, tar_gz_path):
+        """Download/make available/install the compressed directory. This also includes
+        installing the requirements.txt if it exists.
 
-        elif info["type"] == "file":
-            with open(base_path, "wb") as f:
-                f.write(base64.b64decode(info["contents"]))
-            if os.path.basename(info["filename"]) == "requirements.txt" and \
-                            re.match(r'^(talus|talus/tools/[a-zA-Z_0-9]+|talus/components/[a-zA-Z_0-9]+)',
-                                     os.path.dirname(info["filename"])) is not None:
-                self.install_requirements(base_path)
+        :param str dest: The path to where the tar file (and extracted contents) should be saved
+        :param str tar_gz_name: The path to download from code cache
+        :returns: None
+        """
+        self._log.debug("Downloading compressed directory at {!r}".format(tar_gz_path))
 
+        tar_gz = self._git_show(tar_gz_path)
+        dest_tar_path = os.path.join(self._code_dir, tar_gz_path.replace("/", os.path.sep))
+        self._ensure_directory(os.path.dirname(dest_tar_path))
+
+        self._save_file(dest_tar_path, tar_gz)
+        self._extract(dest_tar_path)
+
+    def _extract(self, file_path):
+        """
+        Extracts the .tar.gz file at the specified abs_name
+
+        :param file_path: path to file
+        :return: None
+        """
+        self._log.debug("Extracting file {!r}".format(
+            os.path.basename(file_path)
+        ))
+        tar = tarfile.open(file_path, "r:gz")
+        tar.extractall(os.path.dirname(file_path))
+        tar.close()
+
+    def _run_pip_main(self, pip_args):
+        proc = subprocess.Popen(["pip"] + pip_args)
+        proc.communicate()
+    
     def _git_show(self, path, ref="HEAD"):
         """Return the json object returned from the /code_cache on the web server
 
@@ -490,16 +654,18 @@ class TalusCodeImporter(object):
         if res.status_code // 100 != 2:
             return None
 
-        res = json.loads(res.text)
-
-        # cache existence info about all directories shown!
-        if path != "talus/pypi/simple" and res["type"] == "listing":
-            self._add_to_cache(path, items=res["items"])
+        if res.headers['Content-Type'] == 'application/json':
+            res = json.loads(res.content)
+            # cache existence info about all directories shown!
+            if path != "talus/pypi/simple" and res["type"] == "listing":
+                self._add_to_cache(path, items=res["items"])
+        else:
+            res = res.content
 
         return res
 
     def _add_to_cache(self, path, items=None):
-        cache = self.cache["git"]
+        cache = root = self.cache["git"]
 
         parts = path.split("/")
         for part in parts:
@@ -549,7 +715,7 @@ class TalusBootstrap(object):
 
         if not os.path.exists(config_path):
             self._log.error("ERROR, config path {} not found!".format(config_path))
-            logging.shutdown()
+            self._flush_logs()
             exit(1)
 
         with open(config_path, "r") as f:
@@ -567,11 +733,15 @@ class TalusBootstrap(object):
         self.dev = dev
         self._host_comms = HostComms(self._on_host_msg_received, self._job_id, self._idx, self._tool, dev=dev)
 
+    def _flush_logs(self):
+        logging.shutdown()
+    
     def sys_except_hook(self, type_, value, traceback):
         formatted = traceback.format_exception(type_, value, traceback)
 
-        self._log.exception("there was an exception!")
+        self._log.exception("There was an exception!")
         self._log.error(formatted)
+        cleanup()
         try:
             self._host_comms.send_msg("error", {
                 "message": str(value),
@@ -580,13 +750,13 @@ class TalusBootstrap(object):
             })
         except:
             pass
-        logging.shutdown()
 
     def run(self):
-        self._log.debug("running bootstrap")
+        self._log.info("Running bootstrap")
+        start_time = time.time()
 
         self._host_comms.start()
-        self._host_comms.send_msg("started", {})
+        self._host_comms.send_msg("installing", {})
 
         self._install_code_importer()
 
@@ -597,7 +767,6 @@ class TalusBootstrap(object):
 
         job_mod = getattr(talus_mod, "job")
         Job = getattr(job_mod, "Job")
-
         try:
             job = Job(
                 id=self._job_id,
@@ -608,6 +777,12 @@ class TalusBootstrap(object):
                 progress_callback=self._on_progress,
                 results_callback=self._on_result,
             )
+
+            self._log.info("Took {:.02f}s to start running job!".format(
+                time.time() - start_time
+            ))
+            # should be a signal that things are about to start running
+            self._host_comms.send_msg("started", {})
             job.run()
         except Exception as e:
             self._log.exception("Job had an error!")
@@ -617,23 +792,23 @@ class TalusBootstrap(object):
                 "backtrace": formatted,
                 "logs": self._log_accumulator.get_records()
             })
-        else:
-            # if the debug flag was set, then ALWAYS store the logs!
-            if self._debug:
-                self._host_comms.send_msg("logs", {
-                    "message": "DEBUG LOGS",
-                    "backtrace": "",
-                    "logs": self._log_accumulator.get_records()
-                })
+        self._flush_logs()
+
+        # if the debug flag was set, then ALWAYS store the logs!
+        if self._debug:
+            self._host_comms.send_msg("logs", {
+                "message": "DEBUG LOGS",
+                "backtrace": "",
+                "logs": self._log_accumulator.get_records()
+            })
+
 
         if self._num_progresses == 0:
-            self._log.info("progress was never called, but job finished running, inc progress by 1")
+            self._log.info("Progress was never called, but job finished running, inc progress by 1")
             self._on_progress(1)
 
-        self._host_comms.stop()
-        self._log.debug("finished")
-
         self._host_comms.send_msg("finished", {})
+        self._host_comms.stop()
 
         self._shutdown()
 
@@ -650,7 +825,7 @@ class TalusBootstrap(object):
 
         :param str data: The raw data (probably in json format)
         """
-        self._log.info("received a message from the host: {}".format(data))
+        self._log.info("Received a message from the host: {}".format(data))
         data = json.loads(data)
 
     def _on_progress(self, num):
@@ -659,7 +834,7 @@ class TalusBootstrap(object):
         :param int num: The number to increment the progress count of this job by
         """
         self._num_progresses += num
-        self._log.debug("progress incrementing by {}".format(num))
+        self._log.info("Progress incrementing by {}".format(num))
         self._host_comms.send_msg("progress", num)
 
     def _on_result(self, result_type, result_data):
@@ -667,14 +842,14 @@ class TalusBootstrap(object):
 
         :param object result_data: Any python object to be stored with this job's results (str, dict, a number, etc)
         """
-        self._log.debug("sending result")
+        self._log.info("Sending result")
         self._host_comms.send_msg("result", {"type": result_type, "data": result_data})
 
     def _install_code_importer(self):
         """Install the sys.meta_path finder/loader to automatically load modules from
         the talus git repo.
         """
-        self._log.debug("installing talus code importer")
+        self._log.info("Installing talus code importer")
         code = self._config["code"]
         self._code_importer = TalusCodeImporter(
             code["loc"],

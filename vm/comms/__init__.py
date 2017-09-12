@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # encoding: utf-8
 
+
 import base64
 import logging
 import paramiko
@@ -11,8 +12,8 @@ import tempfile
 import time
 import winrm
 
-logging.basicConfig(level=logging.DEBUG)
 
+logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("paramiko").setLevel(logging.INFO)
 
 
@@ -62,6 +63,7 @@ class WinrmComms(VMComms):
         self._sess = winrm.Session(ip, (username, password))
 
         count = 0
+        e = None
 
         # loop until we can successfully
         while keep_going_event.is_set():
@@ -117,7 +119,7 @@ class WinrmComms(VMComms):
         shell_id = self._sess.protocol.open_shell()
         command_id = self._sess.protocol.run_command(shell_id, cmd, [])
 
-        return shell_id, command_id
+        return (shell_id, command_id)
 
     def put_file(self, location, contents):
         # max is supposed to be 2047 characters
@@ -139,7 +141,7 @@ $s = @"
 "@
 $data = [System.Convert]::FromBase64String($s)
 add-content -value $data -encoding byte -path $filePath
-		""".format(
+        """.format(
             location=location,
             b64_contents=base64.b64encode(contents)
         )
@@ -158,6 +160,7 @@ class SSHComms(VMComms):
 
     def connect(self, ip, username, password, keep_going_event):
         count = 0
+        e = None
 
         while keep_going_event.is_set():
             count += 1
@@ -170,7 +173,7 @@ class SSHComms(VMComms):
                 self._ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                 try:
                     self._ssh.connect(ip, username=username, password=password)
-                except Exception:
+                except Exception as e:
                     continue
 
                 output = self.run_cmd(False, "echo", "blah")
