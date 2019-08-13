@@ -1,33 +1,86 @@
 #!/usr/bin/env python
 # encoding: utf-8
 
+
+"""
+The main worker daemon library.
+"""
+
+
+from Queue import Queue
+import twisted.internet
+import twisted.internet.protocol
+import twisted.internet.reactor
+import twisted.internet.endpoints
+from twisted.protocols import basic as twisted_basic
+import argparse
+import colorama
+import imp
 import json
 import libvirt
 import logging
+import math
+import multiprocessing
 import netifaces
 import os
+import pika
+import pymongo
+import sh
 import signal
 import socket
 import struct
 import sys
 import threading
 import time
+import traceback
+import twisted
 import uuid
-from Queue import Queue
 
-import sh
-import slave.models
+
 from slave.amqp_man import AmqpManager
-from slave.vm import VMHandler, ImageManager
-from twisted.internet import protocol, reactor, endpoints
-from twisted.protocols import basic
+from slave.vm import VMHandler,ImageManager
+import slave.models
 
-logging.basicConfig(
-    level=logging.DEBUG,
-)
-logging.getLogger().handlers[0].setFormatter(logging.Formatter("%(asctime)s %(levelname)s:%(name)s:%(message)s"))
 
+class TalusFormatter(logging.Formatter):
+    """Colorize the logs
+    """
+    def __init__(self):
+        logging.Formatter.__init__(self)
+
+    def format(self, record):
+        msg = "{time} {level:<8} {name:<12} {message}".format(
+            time    = self.formatTime(record),
+            level   = record.levelname,
+            name    = record.name,
+            message = record.getMessage()
+        )
+
+        # if the record has exc_info and it's not None, add it
+        # to the message
+        exc_info = getattr(record, "exc_info", None)
+        if exc_info is not None:
+            msg += "\n"
+            msg += "".join(traceback.format_exception(*exc_info))
+
+        color = ""
+        if record.levelno == logging.DEBUG:
+            color = colorama.Fore.BLUE
+        elif record.levelno == logging.WARNING:
+            color = colorama.Fore.YELLOW
+        elif record.levelno in [logging.ERROR, logging.CRITICAL, logging.FATAL]:
+            color = colorama.Fore.RED
+        elif record.levelno == logging.INFO:
+            color = colorama.Fore.WHITE
+
+        colorized = color + colorama.Style.BRIGHT + msg + colorama.Style.RESET_ALL
+
+        return colorized
+
+
+logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("sh").setLevel(logging.WARN)
+logging.getLogger().handlers[0].setFormatter(TalusFormatter())
 
 
 def _signal_handler(signum=None, frame=None):
@@ -100,8 +153,10 @@ class LibvirtWrapper(object):
                 return val
 
 
-class GuestComms(basic.LineReceiver):
-    """Communicates with the guest hosts as they start running"""
+class GuestComms(twisted_basic.LineReceiver):
+    """Communicates with the guest hosts as they start running. A
+    twisted LineReceiver.
+    """
 
     def connectionMade(self):
         self.setRawMode()
@@ -140,8 +195,10 @@ class GuestComms(basic.LineReceiver):
             self.transport.write(res)
 
 
-class GuestCommsFactory(protocol.Factory):
-    def buildProtocol(self, addr=None):
+class GuestCommsFactory(twisted.internet.protocol.Factory):
+    """The twisted protocol factory
+    """
+    def buildProtocol(self, addr):
         return GuestComms()
 
 
@@ -171,23 +228,44 @@ class Slave(threading.Thread):
     )
 
     _INSTANCE = None
-
     @classmethod
-    def instance(cls, amqp_host=None, max_vms=None, intf=None):
+    def instance(cls, amqp_host=None, max_ram=None, max_cpus=None, intf=None, plugins_dir=None):
         if cls._INSTANCE is None:
-            cls._INSTANCE = cls(amqp_host, max_vms, intf)
+            cls._INSTANCE = cls(amqp_host, max_ram, max_cpus, intf, plugins_dir)
         return cls._INSTANCE
 
-    def __init__(self, amqp_host, max_vms, intf):
-        """Init the slave"""
+    def __init__(self, amqp_host, max_ram, max_cpus, intf, plugins_dir=None):
+        """Init the slave
 
+        :param str amqp_host: The hostname of the AMQP server
+        :param int max_ram: The total amount of usable ram (in MB) for VMs
+        :param int max_cpus: The total amount of cpu cores available for VMs
+        :param str intf: The interface to connecto the AMQP server through
+        :param str plugins_dir: The directory where plugins should be loaded from
+        """
         super(Slave, self).__init__()
 
-        self._max_vms = max_vms
-        self._max_vms_lock = threading.Semaphore(max_vms)
+        self._max_cpus = max_cpus
+        self._max_ram = max_ram
+
+        # see #28 - configurable RAM/cpus
+        # of the form:
+        # {
+        #     "KEY": {
+        #         "lock"  : <Semaphore>,
+        #         "value" : <int>,
+        #     },
+        # }
+        self._locks = {}
+
+        self._lock_init("ram", self._max_ram) # in MB!!
+        self._lock_init("cpus", self._max_cpus)
 
         self._amqp_host = amqp_host
         self._log = logging.getLogger("Slave")
+        
+        self._plugins_dir = plugins_dir
+        self._load_plugins()
 
         self._running = threading.Event()
         self._slave_config_received = threading.Event()
@@ -225,6 +303,42 @@ class Slave(threading.Thread):
         self._last_vm_started_evt = threading.Event()
         self._last_vm_started_evt.set()
 
+    def _load_plugins(self):
+        """Scan plugins directory, if provided, to discover all modules and load them"""
+        self._plugins = []
+        
+        self._log.debug("plugins directory is '{}'".format(self._plugins_dir))
+        
+        if self._plugins_dir == None:
+            return
+        
+        # Find all files with .py extension, and all directories, and attempt to load them as modules
+        plugins_dir = os.path.abspath(self._plugins_dir)
+        for f in os.listdir(plugins_dir):
+            f_path = os.path.join(plugins_dir, f)
+            module_name, ext = os.path.splitext(f)
+            if ext <> '.py' and not os.path.isdir(f_path):
+                continue
+            try:
+                (mod_fp, pathname, description) = imp.find_module(module_name, [plugins_dir])
+                mod = imp.load_module(module_name, mod_fp, pathname, description)
+                self._log.info("imported plugin module {}".format(module_name))
+                self._plugins.append(mod)
+            except:
+                self._log.error("failed to import plugin module {}".format(module_name))
+        
+        self._emit_plugin_event("init", [self, self._log])
+
+    def _emit_plugin_event(self, event, args):
+        try:
+            for plugin in self._plugins:
+                # Find function in module
+                if hasattr(plugin, 'on_{}'.format(event)):
+                    self._log.debug("calling plugin handler on_{} on {}".format(event, plugin.__name__))
+                    getattr(plugin, 'on_{}'.format(event))(*args)
+        except BaseException as e:
+            traceback.print_exc()
+            
     def _gen_mac_addrs(self):
         self._mac_addrs = Queue()
         base = "00:00:c0:a8:7b:{:02x}"
@@ -269,7 +383,8 @@ class Slave(threading.Thread):
                 uuid=self._uuid,
                 ip=self._ip,
                 hostname=self._hostname,
-                max_vms=self._max_vms,
+                max_ram=self._max_ram,
+                max_cpus=self._max_cpus,
             )),
             self.AMQP_SLAVE_STATUS_QUEUE
         )
@@ -328,13 +443,14 @@ class Slave(threading.Thread):
     # -----------------------
 
     def handle_guest_comms(self, data):
-        self._log.info("received guest comms! {}".format(str(data)[:100]))
+        self._log.info("recieved guest comms! {}".format(str(data)[:100]))
 
         if "type" not in data:
             self._log.warn("type not found in guest comms data: {}".format(data))
             return "{}"
 
         switch = dict(
+            installing=self._handle_job_installing,
             started=self._handle_job_started,
             progress=self._handle_job_progress,
             result=self._handle_job_result,
@@ -349,24 +465,53 @@ class Slave(threading.Thread):
 
         return switch[data["type"]](data)
 
-    def _handle_job_started(self, data):
-        self._log.debug("handling started job part: {}:{}".format(data["job"], data["idx"]))
+    def _find_handler(self, job_id, idx):
+        """Try to find the handler matching the specified ``job_id`` and ``idx``.
 
+        :param str job: The id of the job
+        :param int idx: The index of the job part
+        :returns: The found job handler or None
+        """
         found_handler = None
         with self._handlers_lock:
             for handler in self._handlers:
-                if handler.job == data["job"] and handler.idx == data["idx"]:
+                if handler.job == job_id and handler.idx == idx:
                     found_handler = handler
+        
+        return found_handler
 
-        if found_handler is not None:
-            found_handler.on_received_started()
-            self._last_vm_started_evt.set()
-        else:
-            self._log.warn("cannot find the handler for data: {}".format(data))
+    def _handle_job_installing(self, data):
+        """Handle the installing message from the guest.
 
+        :param dict data: The data from the guest
+        :returns: None
+        """
+        self._log.debug("Handling installing job part: {}:{}".format(data["job"], data["idx"]))
+
+        found_handler = self._find_handler(data["job"], data["idx"])
+        if found_handler is None:
+            self._log.warn("Could not find the handler for data: {}".format(data))
+            return
+
+        found_handler.on_received_guest_msg("installing")
+        self._last_vm_started_evt.set()
+        self._emit_plugin_event("job_installing", args=[data])
+    
+    def _handle_job_started(self, data):
+        self._log.debug("handling started job part: {}:{}".format(data["job"], data["idx"]))
+
+        found_handler = self._find_handler(data["job"], data["idx"])
+        if found_handler is None:
+            self._log.warn("Cannot find the handler for data: {}".format(data))
+            return
+
+        found_handler.on_received_guest_msg("started")
+        self._emit_plugin_event("job_started", args=[data])
+    
     def _handle_job_error(self, data):
         self._log.debug("handling job errors: {}:{}".format(data["job"], data["idx"]))
 
+        self._emit_plugin_event("job_error", args=[data])
         self._amqp_man.queue_msg(
             json.dumps(dict(
                 type="error",
@@ -377,10 +522,12 @@ class Slave(threading.Thread):
             )),
             self.AMQP_JOB_STATUS_QUEUE
         )
-
+        found_handler.on_received_guest_msg("error")
+    
     def _handle_job_logs(self, data):
         self._log.debug("handling debug logs from job part: {}:{}".format(data["job"], data["idx"]))
 
+        self._emit_plugin_event("job_logs", args=[data])
         self._amqp_man.queue_msg(
             json.dumps(dict(
                 type="log",
@@ -402,7 +549,9 @@ class Slave(threading.Thread):
                     found_handler = handler
 
         if found_handler is not None:
+            found_handler.on_received_guest_msg("finished")
             found_handler.stop()
+            self._emit_plugin_event("job_finished", args=[data])
         else:
             self._log.warn("cannot find the handler for data: {}".format(data))
 
@@ -418,19 +567,23 @@ class Slave(threading.Thread):
         if matched_handler is not None:
             matched_handler.total_progress += data["data"]
 
+        self._emit_plugin_event("job_progress", args=[data])
+        self._log.debug("sending progress message to AMQP")
         self._amqp_man.queue_msg(
             json.dumps(dict(
                 type="progress",
                 job=data["job"],
                 idx=data["idx"],
-                amt=data["data"],  # it's expected to just be a number
+                amt=data["data"], # it's expected to just be a number
             )),
             self.AMQP_JOB_STATUS_QUEUE
         )
-
+        self._log.debug("done handling job progress")
+    
     def _handle_job_result(self, data):
         self._log.debug("handling job result: {}:{}".format(data["job"], data["idx"]))
 
+        self._emit_plugin_event("job_result", args=[data])
         self._amqp_man.queue_msg(
             json.dumps(dict(
                 type="result",
@@ -447,12 +600,10 @@ class Slave(threading.Thread):
     # amqp stuff
     # -----------------------
 
-    def _on_job_received(self, channel=None, method, properties=None, body):
+    def _on_job_received(self, channel, method, properties, body):
         """
         """
-        self._max_vms_lock.acquire()
-
-        # wait for any restarts to be
+        # wait for any restarts to be 
         if not self._libvirtd_can_be_used.is_set():
             self._log.debug("waiting for libvirtd to restart before starting any new VMs")
         self._libvirtd_can_be_used.wait(2 ** 31)
@@ -465,15 +616,19 @@ class Slave(threading.Thread):
         jobs = slave.models.Job.objects(id=data["job"])
         if len(jobs) == 0:
             self._log.warn("received a job that doesn't exist???")
-            self._max_vms_lock.release()
             return
 
         job_obj = jobs[0]
         if job_obj.status["name"] != "running":
             self._log.warn("job's state is not 'running', so not running it (was {})".format(job_obj.status["name"]))
-            self._max_vms_lock.release()
             return
 
+        self._emit_plugin_event("job_received", args=[job_obj, data])
+
+        # see #28 - configurable ram and cpu counts
+        self._lock_acquire("ram", data["vm_ram"])
+        self._lock_acquire("cpus", data["vm_cpu"])
+        
         # wait until the last vm started to start the next vm
         self._log.debug("waiting for last vm to start running tool")
         self._last_vm_started_evt.wait(2 ** 31)
@@ -494,6 +649,9 @@ class Slave(threading.Thread):
                 network=data["network"],
                 fileset=data["fileset"],
                 timeout=data["vm_max"],
+                # see #28 - specify ram/cpu count
+                ram=data["vm_ram"],
+                cpus=data["vm_cpu"],
                 db_host=self._db_host,
                 code_loc=self._code_loc,
                 code_username=self._code_username,
@@ -503,17 +661,59 @@ class Slave(threading.Thread):
                 mac=self._get_next_mac(),
                 vnc_port=self._get_next_vnc(),
             )
-        except KeyError:
+        except KeyError as e:
             self._log.warn("received malformed job: {!r}".format(data))
-            self._max_vms_lock.release()
+            self._lock_release("ram", data["vm_ram"])
+            self._lock_release("cpus", data["vm_cpu"])
             return
         else:
             with self._handlers_lock:
                 self._handlers.append(handler)
             handler.start()
 
-        self._update_status()
+        self._emit_plugin_event("job_starting", args=[data, handler])
+
+        self.update_status()
         self._log.debug("done starting VMHandler")
+
+    def _lock_init(self, name, val):
+        self._locks[name] = {
+            "lock"  : threading.Semaphore(val),
+            # inverse of semaphore value
+            "value" : 0,
+            "max"   : val,
+        }
+
+    def _lock_value(self, name):
+        """Return the value of the specified lock
+        """
+        return self._locks[name]["value"]
+    
+    def _lock_acquire(self, name, amt):
+        info = self._locks[name]
+        self._log.debug("acquiring {} units from {} ({}/{} currently available)".format(
+            amt,
+            name,
+            info["value"],
+            info["max"],
+        ))
+        for x in xrange(amt):
+            info["lock"].acquire()
+            # the inverse of the Semaphore countdown
+            info["value"] += 1
+    
+    def _lock_release(self, name, amt):
+        info = self._locks[name]
+        self._log.debug("releasing {} units from {} ({}/{} currently available)".format(
+            amt,
+            name,
+            info["value"],
+            info["max"],
+        ))
+        for x in xrange(amt):
+            info["lock"].release()
+            # the inverse of the Semaphore countdown
+            info["value"] -= 1
 
     def _get_next_vnc(self):
         return self._vnc_ports.get()
@@ -528,53 +728,101 @@ class Slave(threading.Thread):
 
         return self._libvirt_conn
 
+    def _report_default_progress(self, handler):
+        """Report default progress of a job handler. This function does not perform
+        any checks on whether this should be done or not - those checks should
+        already have been performed.
+
+        :param VMHandler handler: The handler for the VM that never reported progress
+        :returns: None
+        """
+        self._log.info("Job handler {} exited without reporting any progress, reporting 1 progress".format(
+            handler.job,
+        ))
+        self._handle_job_progress({
+            "job"    : handler.job,
+            "idx"    : handler.idx,
+            "data"   : 1
+        })
+        self._log.info("Done reporting progress")
+    
     def _on_vm_handler_finished(self, handler):
         """
         Handle a finished VM handler
         """
-        self._log.debug("The VM handler {} for job {}:{} has finished".format(handler, handler.job, handler.idx))
+        self._log.debug(
+            "The VM handler {} for job {}:{} has finished (progress: {}, rcvd_started: {})".format(
+                handler,
+                handler.job,
+                handler.idx,
+                handler.total_progress,
+                handler._received_first_msg,
+            )
+        )
 
         # it never reported progress for some reason, so let's report a progress of 1
-        # for just having run the VM (1 vm == 1 progress. ALWAYS!)
-        if handler.total_progress == 0 and handler._received_started_msg:
-            self._log.info("job handler exited without reporting any progress, reporting 1 progress")
-            self._handle_job_progress({
-                "job": handler.job,
-                "idx": handler.idx,
-                "data": 1
-            })
+        # for just having run the VM (1 vm == 1 progress. ALWAYS! - except in debug mode. See
+        # the note below)
+        if handler.total_progress == 0:
+            # if debug is False, data will be dripped into AMQP for
+            # this job until it succeeds. This is the intended behavior
+            # for "normal" jobs that run until progress is reached.
+            #
+            # For debug jobs, however, they are only dripped into the queue *ONCE*, *EVER*.
+            # If progress was 0 and handler._received_first_msg is False, then
+            # an error should be recorded, but progress *SHOULD STILL* be incremented
+            # so that the job isn't stuck in "running"
+            if handler.debug and not handler._received_first_msg:
+                self._log.warn("Debug job {} never received the started message".format(
+                    handler.job,
+                ))
+                self._handle_job_error(dict(
+                    tool = handler.tool,
+                    idx  = handler.idx,
+                    job  = handler.job,
+                    data = dict(
+                        message   = "Started message was never received",
+                        backtrace = "slave/__init__.py - post-processing",
+                        logs      = ["talus slave daemon"],
+                    ),
+                ))
+                self._report_default_progress(handler)
+            
+            # anytime the started message was received, progress should be incremented
+            # if not already incremented
+            elif handler._received_first_msg:
+                self._report_default_progress(handler)
+
+            # means it was not in debug, and started message was never recieved. DO NOT
+            # increment progress in this case.
+            else:
+                pass
 
         # vm died, never received started message, so don't block anymore
-        if not handler._received_started_msg:
+        if not handler._received_first_msg:
             self._last_vm_started_evt.set()
+
+        self._mac_addrs.put(handler.mac)
+        self._vnc_ports.put(handler.vnc_port)
+
+        # see #28 - configurable RAM/cpus
+        self._lock_release("ram", handler.ram)
+        self._lock_release("cpus", handler.cpus)
 
         with self._handlers_lock:
             self._handlers.remove(handler)
             self._total_jobs_run += 1
 
-        #			if self._total_jobs_run % self._libvirtd_restart_vm_count == 0:
-        #				self._log.debug("clearing libvirt restart event")
-        #				self._libvirtd_can_be_used.clear()
-        #
-        #			if len(self._handlers) == 0 and not self._libvirtd_can_be_used.is_set():
-        #				self._log.debug("no vms are running and libvirtd needs to be restarted, so restarting it")
-        #				self._libvirt_conn.restart_libvirtd()
-        #				self._log.debug("setting libvirtd_can_be_used event")
-        #				self._libvirtd_can_be_used.set()
-
-        self._mac_addrs.put(handler.mac)
-        self._vnc_ports.put(handler.vnc_port)
-        self._max_vms_lock.release()
-        self._update_status()
-
-    def _on_vm_handler_vnc_avail(self, handler=None):
+        self.update_status()
+    
+    def _on_vm_handler_vnc_avail(self, handler):
         """
         Send a new status update that will include the changes in the vnc
         info in the handler.
         """
-        self._update_status()
+        self.update_status()
 
-    def _on_slave_all_received(self, channel=None, method, properties=None, body):
+    def _on_slave_all_received(self, channel, method, properties, body):
         """
         """
         self._log.info("received slave all msg from queue: {}".format(body))
@@ -587,7 +835,7 @@ class Slave(threading.Thread):
 
         self._amqp_man.ack_method(method)
 
-    def _on_slave_me_received(self, channel=None, method, properties=None, body):
+    def _on_slave_me_received(self, channel, method, properties, body):
         """
         """
         self._log.info("received slave me msg from queue: {}".format(body))
@@ -621,17 +869,20 @@ class Slave(threading.Thread):
             self._log.info("connecting to mongodb at {}".format(data["db"]))
             self._db_host = data["db"]
             slave.models.do_connect(self._db_host)
+            self._emit_plugin_event("config_db", args=[slave.models])
 
         if "code" in data:
             self._log.info("setting code loc to {}".format(data["code"]["loc"]))
             self._code_loc = data["code"]["loc"]
             self._code_username = data["code"]["username"]
             self._code_password = data["code"]["password"]
+            self._emit_plugin_event("config_code", args=[data["code"]])
 
         if "image_url" in data:
             self._log.info("setting image url to {}".format(data["image_url"]))
             self._image_url = data["image_url"]
             self._image_man.instance().image_url = self._image_url
+            self._emit_plugin_event("config_images", args=[self._image_man.instance()])
 
         if not self._already_consuming:
             self._amqp_man.consume_queue(self.AMQP_JOB_QUEUE, self._on_job_received)
@@ -641,10 +892,12 @@ class Slave(threading.Thread):
 
     def _do_update_status(self):
         while self._running.is_set():
-            self._update_status()
+            self.update_status()
             time.sleep(5)
 
-    def _update_status(self):
+    def update_status(self):
+        """Send a status update message
+        """
         vm_infos = []
         for handler in self._handlers:
             vm_infos.append(dict(
@@ -654,12 +907,21 @@ class Slave(threading.Thread):
                 tool=handler.tool,
                 start_time=handler.start_time,
                 vm_status=handler.vm_status,
+                ram=handler.ram,
+                cpus=handler.cpus,
             ))
 
         self._amqp_man.queue_msg(
             json.dumps(dict(
                 type="status",
                 uuid=self._uuid,
+                hostname=self._hostname,
+                ip=self._ip,
+                max_cpus=self._max_cpus,
+                max_ram=self._max_ram,
+                used_cpus=self._lock_value("cpus"),
+                used_ram=self._lock_value("ram"),
+                max_vms=len(self._handlers),
                 running_vms=len(self._handlers),
                 total_jobs_run=self._total_jobs_run,
                 vms=vm_infos
@@ -668,21 +930,17 @@ class Slave(threading.Thread):
         )
 
 
-def main(amqp_host, max_vms, intf):
+def main(amqp_host, max_ram, max_cpus, intf, plugins_dir=None):
     # _install_sig_handlers()
 
     virt_ip = netifaces.ifaddresses('virbr2')[2][0]['addr']
-    endpoints.serverFromString(reactor, "tcp:55555:interface={}".format(virt_ip)).listen(GuestCommsFactory())
+    server = twisted.internet.endpoints.serverFromString(
+        twisted.internet.reactor,
+        "tcp:55555:interface={}".format(virt_ip)
+    )
+    server.listen(GuestCommsFactory())
 
-    slave = Slave.instance(amqp_host, max_vms, intf)
-    reactor.callWhenRunning(slave.start)
-    reactor.addSystemEventTrigger("during", "shutdown", Slave.instance().stop)
-    reactor.run()
-
-
-if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        sys.stderr.write("USAGE: {} <AMQP_HOST> <MAX_VMS>\n")
-        exit(1)
-
-    main(sys.argv[1], sys.argv[2])
+    slave = Slave.instance(amqp_host, max_ram, max_cpus, intf, plugins_dir)
+    twisted.internet.reactor.callWhenRunning(slave.start)
+    twisted.internet.reactor.addSystemEventTrigger("during", "shutdown", Slave.instance().stop)
+    twisted.internet.reactor.run()

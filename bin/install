@@ -23,22 +23,23 @@ sudo apt-get install -y \
 	genisoimage \
 	libssl-dev \
 	libffi-dev \
-	gcc make pkg-config libxml2-dev libgnutls-dev libdevmapper-dev libcurl4-gnutls-dev python-dev libpciaccess-dev libxen-dev libnl-route-3-dev libyajl-dev uuid-dev libpcap-dev xsltproc
+	gcc \
+    make \
+    pkg-config \
+    libxml2-dev \
+    libgnutls-dev \
+    libdevmapper-dev \
+    libcurl4-gnutls-dev \
+    python-dev \
+    libpciaccess-dev \
+    libxen-dev \
+    libnl-route-3-dev \
+    libyajl-dev \
+    uuid-dev \
+    libpcap-dev \
+    xsltproc
 
-sudo pip install \
-	mongoengine \
-	mock \
-	netifaces \
-	paramiko \
-	pika \
-	pymongo \
-	pywinrm \
-	scp \
-	sh \
-	twisted \
-	xmltodict \
-	service_identity \
-	cryptography
+sudo pip install -r "$DIR"/../requirements.txt
 
 # TODO - figure out what's up with this?
 # libvirt network filters weren't working until I did
